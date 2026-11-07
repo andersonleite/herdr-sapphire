@@ -40,8 +40,37 @@ else:
 PY
 fi
 
-# 3. TODO (ao publicar o layout): copiar layouts/, mods/, themes/ e highlight/ do repo
-#    para ~/.config/herdr-app sem sobrescrever nomes já existentes, e rodar
-#    `herdr-app do layout.switch '{"name":"sapphire"}'`.
+# 3. Layout, temas, mods e highlight → pasta do Herdr. Só toca nos nomes deste pacote
+#    (sapphire*, git-graph, highlight/); o resto da pasta fica como está.
+#    Na máquina onde o layout é desenvolvido (marcador .sapphire-dev) a fonte da verdade é
+#    a pasta do Herdr, então esta etapa é pulada: use ./export.sh no sentido contrário.
+HERDR="${HERDR_APP_HOME:-$HOME/.config/herdr-app}"
+if [ -f "$HERDR/.sapphire-dev" ]; then
+  echo "herdr: $HERDR é a cópia de desenvolvimento (.sapphire-dev); layout não copiado"
+else
+  mkdir -p "$HERDR/layouts" "$HERDR/themes" "$HERDR/mods"
+  cp "$REPO/layouts/sapphire.json" "$REPO/layouts/sapphire.svg" "$HERDR/layouts/"
+  cp "$REPO/themes/sapphire.json" "$REPO/themes/sapphire-light.json" "$HERDR/themes/"
+  for m in sapphire-spaces sapphire-tabs sapphire-files sapphire-changes git-graph; do
+    rm -rf "$HERDR/mods/$m"
+    cp -R "$REPO/mods/$m" "$HERDR/mods/$m"
+  done
+  rm -rf "$HERDR/highlight"
+  cp -R "$REPO/highlight" "$HERDR/highlight"
+  echo "herdr: layout sapphire copiado para $HERDR"
+  if command -v herdr-app >/dev/null 2>&1 && [ -z "${HERDR_APP_HOME:-}" ]; then
+    for m in sapphire-spaces sapphire-tabs sapphire-files sapphire-changes git-graph; do
+      (cd "$HERDR" && herdr-app check "mods/$m") || echo "aviso: herdr-app check falhou em $m"
+    done
+    herdr-app do layout.switch '{"name":"sapphire"}' >/dev/null 2>&1 \
+      && echo "herdr: layout sapphire ativo" \
+      || echo "herdr: abra o Herdr e escolha o layout sapphire (ctrl-shift-l)"
+  fi
+fi
+
+# 4. O que o layout precisa para rodar.
+for p in node git python3; do
+  command -v "$p" >/dev/null 2>&1 || echo "aviso: '$p' não está no PATH; os painéis Changes/Graph (node) ou o comando sapphire (python3) não vão funcionar"
+done
 
 echo "pronto — abra um terminal novo (ou: source $ZSHRC)"
