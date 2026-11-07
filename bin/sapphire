@@ -1,0 +1,51 @@
+#!/bin/sh
+# sapphire — troca o layout Herdr "sapphire" entre dark e light.
+#
+#   sapphire light    usa o tema sapphire-light
+#   sapphire dark     usa o tema sapphire (dark)
+#   sapphire toggle   alterna
+#   sapphire status   mostra o estado atual
+#
+# Só grava `appearance` em ~/.config/herdr-app/settings.json; o Herdr aplica ao vivo.
+# Os terminais com Claude Code seguem o fundo do terminal quando o tema dele é "auto"
+# (install.sh configura isso em ~/.claude/settings.json).
+set -eu
+
+SETTINGS="${HERDR_APP_HOME:-$HOME/.config/herdr-app}/settings.json"
+mode="${1:-status}"
+
+current() {
+  python3 - "$SETTINGS" <<'PY'
+import json, sys
+try:
+    print(json.load(open(sys.argv[1])).get("appearance") or "system")
+except Exception:
+    print("system")
+PY
+}
+
+set_appearance() {
+  python3 - "$SETTINGS" "$1" <<'PY'
+import json, sys, os
+path, value = sys.argv[1], sys.argv[2]
+data = {}
+if os.path.exists(path):
+    with open(path) as f:
+        data = json.load(f)
+data["appearance"] = value
+tmp = path + ".tmp"
+with open(tmp, "w") as f:
+    json.dump(data, f, indent=2)
+    f.write("\n")
+os.replace(tmp, path)
+PY
+}
+
+case "$mode" in
+  light|dark) set_appearance "$mode"; echo "sapphire: $mode" ;;
+  toggle)
+    if [ "$(current)" = "light" ]; then set_appearance dark; echo "sapphire: dark"
+    else set_appearance light; echo "sapphire: light"; fi ;;
+  status) echo "sapphire: $(current)" ;;
+  *) echo "uso: sapphire light|dark|toggle|status" >&2; exit 2 ;;
+esac
