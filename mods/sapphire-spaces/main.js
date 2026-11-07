@@ -43,9 +43,9 @@ const MARKS = {
 };
 const MARK = () => MARKS[settings().dark !== false ? "dark" : "light"];
 
-// Spaces named "[xy] …" or "[xyz] …" form a group: they share one avatar color, and the
-// avatar shows the tag instead of staying blank. The tag is left out of the shown name.
-const GROUP = /^\[([a-z0-9]{2,3})\]\s*/i;
+// Spaces named "[x] …", "[xy] …" or "[xyz] …" form a group: they share one avatar color,
+// and the avatar shows the tag instead of staying blank. The tag is left out of the shown name.
+const GROUP = /^\[([a-z0-9]{1,3})\]\s*/i;
 export const group = (name) => GROUP.exec(name)?.[1].toUpperCase() ?? null;
 const shownName = (name) => name.replace(GROUP, "") || name;
 // Dark text on the light purples, light text on the dark ones: fixed inks, not the
@@ -439,7 +439,7 @@ export default class Spaces extends View {
           .items_center()
           .when(Boolean(tree), el => el.pl(22).child(svg("mods/workspace-chrome/branch.svg").size(13).text_color(t.dim)))
           .when(!tree, el => el.child(div().size(18).flex_none().rounded(5).bg(fill).flex().items_center().justify_center()
-            .when(Boolean(tag), el => el.child(div().text_size(tag.length > 2 ? 7 : 8.5).font_semibold().text_color(onFill(fill, t)).child(tag)))))
+            .when(Boolean(tag), el => el.child(div().text_size(tag.length > 2 ? 7 : tag.length > 1 ? 8.5 : 10).font_semibold().text_color(onFill(fill, t)).child(tag)))))
           .child(div().flex_shrink(0).max_w(150).truncate().text_size(12).text_color(t.foreground).child(shownName(w.name)))
           .child(g ? this.gitTail(g, tree, w.name, t) : div().flex_1()),
       );
