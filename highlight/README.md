@@ -10,8 +10,9 @@ Syntax colors (GitHub's dark theme, via Shiki) for Anderson's Herdr mods. Not sh
   `highlight.mjs`). The copies in `mods/sapphire-changes/` and `mods/git-graph/` must stay
   identical to this one: a mod can't import from outside its folder.
 
-`mods/sapphire-files` (the Files panel) still runs Shiki in the mod itself (`shiki.js`),
-one file at a time in small pieces; move it here too if it ever runs out of memory.
+`mods/sapphire-files` (the Files panel) colors whole files through it too (a side with
+`all: true`, a compact answer): it used to run Shiki in the mod itself, and a large file ran
+the shared runtime out of memory (every mod then failed to render with `null`).
 
 Speed: `highlight.mjs` takes about half a second per run (node starts, the grammars warm up),
 so the Graph panel colors a selected commit's first files before they're clicked and keeps

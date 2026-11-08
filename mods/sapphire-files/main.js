@@ -5,8 +5,7 @@
 // line between them drags to resize the tree (remembered; double-click for the default).
 import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex, Editor, EditorState, Input, InputState, Scrollbar, TextView, VirtualListScrollHandle, v_virtual_list } from "gpui-base";
-import { spaces, panes, focused, exec, readTextFile, watchFolder, theme, settings, window } from "herdr";
-import { tokenizer } from "./shiki.js";
+import { spaces, panes, focused, exec, readTextFile, watchFolder, theme, settings, window, appHome } from "herdr";
 import { index, search } from "./fuzzy.js";
 import { definitions, occurrences, SKIP } from "./definitions.js";
 
@@ -38,18 +37,16 @@ const GITHUB_SYNTAX = {
 };
 const isDark = () => settings().dark !== false;
 const syntax = () => GITHUB_SYNTAX[isDark() ? "dark" : "light"];
-const SHIKI_THEME = () => (isDark() ? "github-dark-default" : "github-light-default");
 // JSON and the JavaScript family are drawn here instead of in the editor, one row per line,
 // only the visible ones built. JSON: the editor colors a key like any other string, and
 // GitHub doesn't (keys green, values blue). JS/TS/JSX/TSX: the editor has no TypeScript
-// grammar and no color for tags, so Shiki tokenizes them (./shiki.js, built from
-// shiki.entry.mjs) with GitHub's own grammars and dark theme.
+// grammar and no color for tags, so Shiki tokenizes them with GitHub's own grammars and
+// theme — in a separate program (highlight/highlight.mjs, run with node), as Changes and
+// Graph do: the mods' runtime is small and shared, and Shiki inside it ran the window out
+// of memory. The file shows plain at once and colors when the program answers (~0.5 s).
 const SHIKI = { js: "javascript", mjs: "javascript", cjs: "javascript", jsx: "jsx", ts: "typescript", mts: "typescript", cts: "typescript", tsx: "tsx" };
-// Shiki runs on the thread that draws the window (its first file takes most of a second,
-// later ones a fraction of a millisecond a line). So the first lines are colored at once
-// and the rest a piece at a time, plain until their turn.
-const SHIKI_MAX = 200000, SHIKI_LINE_MAX = 2000; // characters; bigger files and longer lines stay in the editor
-const SHIKI_PIECE = 60; // lines colored per turn
+const SHIKI_MAX = 200000; // characters; bigger files stay in the editor
+const COLOR_WAIT = 1500; // ms the panel waits for a file's colors before showing it plain
 const JSON_SYNTAX = {
   dark: { key: "#7ee787", string: "#a5d6ff", literal: "#79c0ff", comment: "#8b949e", text: "#e6edf3" },
   light: { key: "#116329", string: "#0a3069", literal: "#0550ae", comment: "#6e7781", text: "#1f2328" },
@@ -146,7 +143,7 @@ export default class Files extends View {
     // Search: the query, every file (listed on the first search), the ranked hits, the chosen one.
     this.query = ""; this.files = null; this.hits = []; this.at = 0; this.hitScroll = VirtualListScrollHandle.new();
     this.searchHandle = cx.focus_handle();
-    this.input = InputState.new({ placeholder: "Search files…" });
+    this.input = InputState.new();
     this.input.on("change", (_e, cx) => this.setQuery(this.input.value(), cx));
     this.input.on("submit", (_e, cx) => {
       if (this.content) { const hit = this.contentHits[this.at]; if (hit) this.open(hit.path, cx, hit.line); return; }
@@ -423,25 +420,31 @@ export default class Files extends View {
           const body = (text.length > 400000 ? text.slice(0, 400000) + "\n… (file truncated)" : text).replace(/\r\n?/g, "\n").replace(/\t/g, "  ").replace(/\n$/, "");
           const lines = body.split("\n"), longest = lines.reduce((n, line) => Math.max(n, line.length), 0), width = Math.ceil(Math.min(longest, 4020) * CHAR);
           if (!SHIKI[ext]) { this.view = { count: lines.length, width, runs: i => jsonRuns(lines[i].length > 4000 ? lines[i].slice(0, 4000) + "… (line truncated)" : lines[i]) }; if (line) this.reveal(line, cx); return; }
-          if (longest <= SHIKI_LINE_MAX) try {
-            const next = tokenizer(SHIKI[ext], SHIKI_THEME()), rows = new Array(lines.length);
-            const view = { count: lines.length, width, code: true, runs: i => rows[i] ?? [{ text: lines[i], color: jsonColors().text }] };
-            const color = from => next(lines.slice(from, from + SHIKI_PIECE).join("\n")).forEach((runs, k) => { rows[from + k] = runs; });
-            color(0);
-            this.view = view;
-            if (line) this.reveal(line, cx);
-            // The rest in turns, letting the window draw in between; a file closed meanwhile stops them.
-            const rest = (from, cx) => {
-              if (from >= lines.length || this.view !== view) return;
-              cx.timer.after(4, cx => {
-                if (this.view !== view) return;
-                try { color(from); } catch (e) { console.log("files: shiki stopped", String(e)); return; }
-                cx.notify(); rest(from + SHIKI_PIECE, cx);
+          // A local file only: the program reads it from disk (a remote one opens in the editor).
+          // The panel stays empty until the colors come (a cached file: at once; a new one:
+          // under a second) rather than flashing plain text first; past COLOR_WAIT it shows
+          // plain and colors when they arrive.
+          if (!on) {
+            const rows = new Array(lines.length), plain = jsonColors().text;
+            const view = { count: lines.length, width, code: true, runs: i => rows[i] ?? [{ text: lines[i], color: plain }] };
+            const present = () => { if (this.view !== view && this.file === path && this.current(context)) { this.view = view; if (line) this.reveal(line, cx); cx.notify(); } };
+            cx.timer.after(COLOR_WAIT, () => present());
+            try {
+              const request = { theme: isDark() ? "dark" : "light", jobs: [{ lang: SHIKI[ext], sides: [{ file: `${root}/${path}`, all: true }] }] };
+              const r = await exec("node", [`${appHome()}/highlight/highlight.mjs`, JSON.stringify(request)], { cwd: root });
+              if (this.file !== path || !this.current(context) || (this.view && this.view !== view)) return;
+              const got = r.code === 0 ? JSON.parse(r.stdout)?.[0]?.[0] : null;
+              if (!got) console.log("files: highlight failed", r.stderr?.slice(0, 200) || r.code);
+              // Each line only if the file on disk still reads as the one shown.
+              else got.lines.forEach((runs, i) => {
+                if (!runs || i >= lines.length) return;
+                if (runs.map(([text]) => text).join("") !== lines[i]) return;
+                rows[i] = runs.map(([text, c]) => ({ text, color: got.colors[c] }));
               });
-            };
-            rest(SHIKI_PIECE, cx);
+            } catch (e) { console.log("files: highlight failed", String(e)); }
+            present();
             return;
-          } catch (e) { console.log("files: shiki failed, using the editor", String(e)); }
+          }
         }
         this.code = EditorState.new({ language: LANG[ext] ?? ext, readonly: true,
           value: text.length > 400000 ? text.slice(0, 400000) + "\n… (file truncated)" : text,
@@ -656,7 +659,7 @@ export default class Files extends View {
         .child(v_flex().id("files-preview").w(previewWidth).h_full().min_h(0).flex_none().overflow_hidden()
           .when(!this.dragging, el => el.transition("width", { duration: SLIDE, easing: "ease-out" })) // a drag follows the pointer
           .when(open, el => el.child(v_flex().w(previewWidth).flex_1().min_h(0)
-            .child(this.view ? this.codeView(t) : this.markdown !== null && this.rendered ? this.markdownView() : this.code ? Editor.new(this.code).flex_1().min_h(0) : div().p(12).text_color(t.dim).child(this.fileError || "Loading file…")))))
+            .child(this.view ? this.codeView(t) : this.markdown !== null && this.rendered ? this.markdownView() : this.code ? Editor.new(this.code).flex_1().min_h(0) : this.fileError ? div().p(12).text_color(t.dim).child(this.fileError) : div()))))
         .child(v_flex().id("files-side").flex_1().min_w(0).h_full().min_h(0).overflow_hidden()
           .child(v_flex().w_full().flex_1().min_h(0)
             .when(open, el => el.min_w(treeWidth).border_l(1).border_color(this.dragging ? t.accent : t.border))

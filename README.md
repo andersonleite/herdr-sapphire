@@ -64,7 +64,7 @@ themes/sapphire.json       dark theme
 themes/sapphire-light.json light theme (off-white, purple accent, GitHub Light ANSI)
 mods/sapphire-*            spaces, tabs, files, changes (forks of Herdr's shipped mods)
 mods/git-graph             the Graph panel
-highlight/                 Shiki syntax colors (GitHub dark/light) for Changes and Graph
+highlight/                 Shiki syntax colors (GitHub dark/light) for Files, Changes and Graph
 shell/prompt.zsh           pure zsh prompt, no dependencies
 bin/sapphire               the light/dark switch
 install.sh · export.sh
@@ -77,9 +77,9 @@ On the machine where the layout is developed, `~/.config/herdr-app` is the sourc
 step 3, and `./export.sh` copies the layout from Herdr into this repo to commit. Everywhere
 else, the repo is the source and `install.sh` copies it into Herdr.
 
-The Shiki bundles (`mods/sapphire-files/shiki.js`, `highlight/shiki.mjs`) are built from the
-`shiki.entry.mjs` next to each; the build command is in their header (run it in a scratch
-folder, never inside a mod: Herdr reloads a mod on every write to its folder).
+The Shiki bundle (`highlight/shiki.mjs`) is built from `highlight/shiki.entry.mjs`; the build
+command is in its header (run it in a scratch folder). Shiki never runs inside a mod: the
+mods' runtime is small and shared, and a large file ran it out of memory.
 
 Not listed on herdr.dev on purpose (no `herdr-layout` topic); it would need a `RECIPE.md`
 and `preview.png` first.
