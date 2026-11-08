@@ -8,7 +8,7 @@ import { v_flex, h_flex, Editor, EditorState, Input, InputState, Scrollbar, Text
 import { spaces, panes, focused, exec, readTextFile, watchFolder, theme, settings, window } from "herdr";
 import { tokenizer } from "./shiki.js";
 import { index, search } from "./fuzzy.js";
-import { definitions, SKIP } from "./definitions.js";
+import { definitions, occurrences, SKIP } from "./definitions.js";
 
 function location() {
   const space = spaces().find(s => s.active), f = focused();
@@ -57,11 +57,15 @@ const JSON_SYNTAX = {
 const jsonColors = () => JSON_SYNTAX[isDark() ? "dark" : "light"];
 const JSON_TOKEN = /("(?:[^"\\]|\\.)*"?)(?=(\s*:)?)|(\/\/.*|\/\*.*?(?:\*\/|$))|(-?\d[\w.+-]*|\b(?:true|false|null)\b)|(\s+)|([^\s"]+?)/g;
 const ROW = 19, CHAR = 7.2; // px: a code line's height and a character's width at text size 12
-// Go to definition (Shiki-drawn files only): with ⌘ held, each identifier is its own element,
-// underlined under the pointer; ⌘-click looks its definition up (./definitions.js) and opens
-// it, or lists the candidates. Words colored as keywords, strings or comments stay plain.
+// Go to definition and uses (Shiki-drawn files only): with ⌘ or ⌥ held the row under the
+// pointer lights; ⌘-click on a name looks its definition up (./definitions.js) and opens it,
+// or lists the candidates; ⌥-click lists every line that uses the name. ⌘-click on a quoted
+// path opens that file. The search box's `/text` searches inside the folder's files.
 const WORD = /[A-Za-z_$][\w$]*|[^A-Za-z_$]+/g;
 const MARK_MS = 1800; // how long the line jumped to stays lit
+const CONTENT = "/"; // the search box prefix that searches file contents
+const CONTENT_DELAY = 250; // ms after the last keystroke before searching
+const CONTENT_MAX = 1000; // lines listed
 
 // One line as runs of one color; neighbours of a color (and the spaces after them) are one run.
 function jsonRuns(line) {
@@ -144,13 +148,18 @@ export default class Files extends View {
     this.searchHandle = cx.focus_handle();
     this.input = InputState.new({ placeholder: "Search files…" });
     this.input.on("change", (_e, cx) => this.setQuery(this.input.value(), cx));
-    this.input.on("submit", (_e, cx) => { const hit = this.hits[this.at]; if (hit) this.open(hit.file.path, cx); });
+    this.input.on("submit", (_e, cx) => {
+      if (this.content) { const hit = this.contentHits[this.at]; if (hit) this.open(hit.path, cx, hit.line); return; }
+      const hit = this.hits[this.at]; if (hit) this.open(hit.file.path, cx);
+    });
+    // Content search (`/text`): the text asked, its lines, the search running, its error.
+    this.content = null; this.contentHits = []; this.contentBusy = false; this.contentError = null; this.contentSeq = 0;
     this.input.on("focus", (_e, cx) => { this.searching = true; cx.notify(); });
     this.input.on("blur", (_e, cx) => { this.searching = false; cx.notify(); });
     this.treeWidth = Number(localStorage.getItem("treeWidth")) || null; this.dragging = false;
     // Go to definition: ⌘ seen on the last pointer move; where ⌘-clicks came from, to go
     // back; the line to light; the candidates listed; a short notice in the header.
-    this.codeScroll = VirtualListScrollHandle.new(); this.cmd = false; this.history = []; this.mark = null; this.picks = null; this.notice = null;
+    this.codeScroll = VirtualListScrollHandle.new(); this.cmd = false; this.alt = false; this.history = []; this.mark = null; this.picks = null; this.notice = null;
     this.entries = new Map(); this.folders = new Set(); this.pending = new Set(); this.marks = {};
     this.refresh(cx);
     cx.timer.every(10000, cx => this.refresh(cx));
@@ -187,6 +196,7 @@ export default class Files extends View {
       this.context = { key: next, cwd, on }; this.root = cwd; this.on = on; this.entries = new Map(); this.folders = new Set(saved?.folders);
       this.pending = new Set(); this.marks = {}; this.show(null); this.watched = null; this.error = null; this.limited = false;
       this.files = null; this.hits = []; this.searchError = null; if (this.query) { this.query = ""; this.input.set_value(""); }
+      this.content = null; this.contentHits = []; this.contentError = null; this.contentBusy = false; this.contentSeq++;
       this.loading = false;
       if (saved?.file) this.show(saved.file, cx);
     }
@@ -221,6 +231,8 @@ export default class Files extends View {
   setQuery(query, cx) {
     if (query === this.query) return;
     this.query = query; this.at = 0;
+    if (query.startsWith(CONTENT)) { this.hits = []; this.searchContent(query.slice(CONTENT.length).trim(), cx); cx.notify(); return; }
+    if (this.content !== null) { this.content = null; this.contentHits = []; this.contentError = null; this.contentSeq++; }
     if (query.trim() && !this.files) this.list(cx);
     this.rank();
     cx.notify();
@@ -231,6 +243,43 @@ export default class Files extends View {
     for (const hit of this.hits) hit.marks = new Set(hit.positions);
     this.at = Math.min(this.at, Math.max(0, this.hits.length - 1));
     if (this.hits.length) this.hitScroll.scroll_to_item(this.at);
+  }
+
+  // `/text` in the search box: the lines of the folder's files with that text, any case,
+  // a moment after the last keystroke. Reused by the ⌥-click on a name (whole word).
+  searchContent(text, cx) {
+    this.content = text;
+    const seq = ++this.contentSeq, context = this.context;
+    if (text.length < 2) { this.contentHits = []; this.contentError = null; this.contentBusy = false; return; }
+    cx.timer.after(CONTENT_DELAY, cx => {
+      if (seq !== this.contentSeq || !this.root) return;
+      this.contentBusy = true; cx.notify();
+      cx.spawn(async cx => {
+        try {
+          const hits = await occurrences(text, { root: context.cwd, on: context.on, word: false, ignoreCase: true, max: CONTENT_MAX });
+          if (seq !== this.contentSeq || !this.current(context)) return;
+          this.contentHits = hits; this.contentError = null; this.at = 0;
+          if (hits.length) this.hitScroll.scroll_to_item(0);
+        } catch (e) { if (seq === this.contentSeq) { this.contentHits = []; this.contentError = String(e); } }
+        finally { if (seq === this.contentSeq) this.contentBusy = false; cx.notify(); }
+      });
+    });
+  }
+
+  // ⌥-click on `name`: every line using it, listed over the code by file.
+  uses(name, line, cx) {
+    if (this.looking || !this.root) return;
+    const context = this.context, from = { path: this.file, line };
+    this.looking = name; this.picks = null; cx.notify();
+    cx.spawn(async cx => {
+      try {
+        const hits = await occurrences(name, { root: context.cwd, on: context.on, word: true, max: CONTENT_MAX });
+        if (!this.current(context) || this.file !== from.path) return;
+        if (hits.length === 0) this.say(`No uses of ${name} found`, cx);
+        else this.picks = { name, label: "uses", from, hits };
+      } catch (e) { if (this.current(context)) this.say(`Lookup failed: ${String(e).slice(0, 80)}`, cx); }
+      finally { this.looking = null; cx.notify(); }
+    });
   }
 
   // Lists every file of this folder for the search, again whenever the folder changes.
@@ -270,7 +319,7 @@ export default class Files extends View {
         if (!this.current(context) || this.file !== from.path) return;
         if (hits.length === 0) this.say(`No definition of ${name} found`, cx);
         else if (hits.length === 1) this.jump(hits[0].path, hits[0].line, from, cx);
-        else this.picks = { name, from, hits, at: 0 };
+        else this.picks = { name, label: "definitions", from, hits };
       } catch (e) { if (this.current(context)) this.say(`Lookup failed: ${String(e).slice(0, 80)}`, cx); }
       finally { this.looking = null; cx.notify(); }
     });
@@ -358,7 +407,7 @@ export default class Files extends View {
   show(path, cx, line) {
     this.code?.release(); this.code = null; this.view = null; this.markdown = null; this.file = path; this.fileError = null;
     this.shownDark = isDark(); // the appearance the preview was colored for (see render)
-    this.mark = null; this.picks = null; this.cmd = false;
+    this.mark = null; this.picks = null; this.cmd = this.alt = false;
     if (!path) this.history = [];
     if (!path || !cx) return;
     const context = this.context, root = this.root, on = this.on;
@@ -433,7 +482,7 @@ export default class Files extends View {
     // (`on_item_click`: which row) and the word from where the pointer last was
     // (`on_mouse_move` on the sheet behind the rows).
     const s = syntax(), strings = new Set([s.string, s["string.escape"]].map(c => c.toLowerCase()));
-    const linked = Boolean(view.code) && this.cmd && !this.picks;
+    const linked = Boolean(view.code) && (this.cmd || this.alt) && !this.picks;
     const row = index => h_flex().h(ROW).flex_none().items_center().whitespace_nowrap()
       .when(index === this.mark, el => el.bg(t.selected))
       .when(linked, el => el.id(`files-row-${index}`).cursor_pointer().hover(el => el.bg(t.hover)))
@@ -448,26 +497,27 @@ export default class Files extends View {
       // Inside a string: a quoted path opens that file.
       let at = 0, run = null;
       for (const r of runs) { if (col < at + r.text.length) { run = r; break; } at += r.text.length; }
-      if (run && strings.has(String(run.color).toLowerCase())) {
+      if (this.cmd && run && strings.has(String(run.color).toLowerCase())) {
         for (const m of text.matchAll(/(["'`])([^"'`]*)\1/g)) if (m.index < col && col < m.index + m[0].length) { this.openPath(m[2], index + 1, cx); return; }
         return;
       }
       for (const m of text.matchAll(WORD)) if (m.index <= col && col < m.index + m[0].length) {
-        if (/^[A-Za-z_$]/.test(m[0]) && !SKIP.has(m[0])) this.goto(m[0], index + 1, cx);
+        if (/^[A-Za-z_$]/.test(m[0]) && !SKIP.has(m[0])) (this.cmd ? this.goto : this.uses).call(this, m[0], index + 1, cx);
         return;
       }
     };
     return div().id("files-code").flex_1().min_h(0).relative().font_family(settings().font_family ?? "JetBrains Mono").text_size(12)
-      .when(Boolean(view.code), el => el.on_hover((hovered, cx) => { if (!hovered && this.cmd) { this.cmd = false; cx.notify(); } }))
+      .when(Boolean(view.code), el => el.on_hover((hovered, cx) => { if (!hovered && (this.cmd || this.alt)) { this.cmd = this.alt = false; cx.notify(); } }))
       .child(div().id("files-code-x").size_full().overflow_x_scrollbar()
         .child(div().id("files-code-sheet").w_full().min_w(numbers + gap + view.width + 24).h_full()
           // ⌘ is read off pointer moves: the panel has no keyboard focus to see the key itself.
           .when(Boolean(view.code), el => el.on_mouse_move((e, cx) => {
             this.pointerX = e.local_position.x;
-            this.cmd = Boolean(e.modifiers.platform);
-            // While ⌘ is held, every move redraws so the lit row follows the pointer (the
-            // hover style is only re-read when the list paints).
-            if (this.cmd || this.litRows) { this.litRows = this.cmd; cx.notify(); }
+            this.cmd = Boolean(e.modifiers.platform); this.alt = Boolean(e.modifiers.alt);
+            // While ⌘ or ⌥ is held, every move redraws so the lit row follows the pointer
+            // (the hover style is only re-read when the list paints).
+            const lit = this.cmd || this.alt;
+            if (lit || this.litRows) { this.litRows = lit; cx.notify(); }
           }))
           .child(v_virtual_list(id, view.count, ROW, i => String(i),
             range => Array.from({ length: range.end - range.start }, (_, k) => row(range.start + k))).track_scroll(this.codeScroll).size_full()
@@ -476,20 +526,30 @@ export default class Files extends View {
       .when(Boolean(this.picks), el => el.child(this.picksView(t)));
   }
 
-  // Several places define the ⌘-clicked name: a list over the code to choose from.
+  // The places a ⌘-clicked name is defined, or an ⌥-clicked one used: a list over the code,
+  // by file, to choose from. Click outside to close.
   picksView(t) {
-    const { name, from, hits } = this.picks;
+    const { name, label, from, hits } = this.picks;
+    const files = [];
+    for (const hit of hits) { const last = files[files.length - 1]; if (last?.path === hit.path) last.hits.push(hit); else files.push({ path: hit.path, hits: [hit] }); }
+    const rows = files.flatMap((file, f) => [
+      h_flex().id(`files-pick-file-${f}`).h(24).flex_none().items_center().gap(6).px(10).mt(f ? 4 : 0).whitespace_nowrap().text_size(11.5)
+        .child(div().min_w(0).truncate().text_color(t.accent).child(file.path)).child(div().flex_none().text_color(t.dim).child(String(file.hits.length))),
+      ...file.hits.map((hit, i) => h_flex().id(`files-pick-${f}-${i}`).h(ROW + 5).flex_none().items_center().gap(8).pl(18).pr(10).cursor_pointer().whitespace_nowrap().hover(el => el.bg(t.hover))
+        .when(hit.path === from.path && hit.line === from.line, el => el.bg(t.selected))
+        .on_click((_e, cx) => this.jump(hit.path, hit.line, from, cx))
+        .child(div().w(34).flex_none().text_right().text_color(t.dim).child(String(hit.line)))
+        .child(div().flex_1().min_w(0).truncate().text_color(t.muted).child(hit.text))),
+    ]);
     return div().id("files-picks-sheet").absolute().inset_0().on_click((_e, cx) => { this.picks = null; cx.notify(); })
-      .child(v_flex().id("files-picks").absolute().top(8).left(12).right(12).max_w(560).max_h(ROW * 14 + 40).rounded(8).overflow_hidden()
+      .child(v_flex().id("files-picks").absolute().top(8).left(12).right(12).max_w(640).max_h(ROW * 18 + 40).rounded(8).overflow_hidden()
         .bg(t.popover).border_1().border_color(t.border).shadow_lg().text_size(12)
         .on_click((_e, cx) => cx.stop_propagation())
         .child(h_flex().h(28).px(10).flex_none().items_center().gap(6).border_b(1).border_color(t.border).text_color(t.dim).text_size(11.5)
-          .child(div().font_semibold().text_color(t.foreground).child(name)).child(div().child(`· ${hits.length} definitions`)))
-        .child(v_flex().flex_1().min_h(0).overflow_y_scrollbar().py(4).children(hits.map((hit, i) =>
-          h_flex().id(`files-pick-${i}`).h(ROW + 7).flex_none().items_center().gap(8).px(10).cursor_pointer().whitespace_nowrap().hover(el => el.bg(t.hover))
-            .on_click((_e, cx) => this.jump(hit.path, hit.line, from, cx))
-            .child(div().flex_none().text_color(t.accent).child(`${hit.path}:${hit.line}`))
-            .child(div().flex_1().min_w(0).truncate().text_color(t.muted).child(hit.text))))));
+          .child(div().font_semibold().text_color(t.foreground).child(name))
+          .child(div().child(`· ${hits.length} ${label} in ${files.length} ${files.length === 1 ? "file" : "files"}`))
+          .child(div().flex_1()))
+        .child(v_flex().id("files-picks-list").flex_1().min_h(0).overflow_y_scrollbar().py(4).children(rows)));
   }
 
   rows(prefix, depth, out, t) {
@@ -519,15 +579,16 @@ export default class Files extends View {
     // it with the tree hidden. The tree fills what is left, so both slide together.
     const treeWidth = this.docked();
     const previewWidth = !open ? 0 : this.pinned ? Math.max(0, this.width - treeWidth) : this.width;
+    const count = this.content !== null ? this.contentHits.length : this.hits.length; // rows the arrow keys walk
     const searchBar = () => h_flex().id("files-search").track_focus(this.searchHandle).h(30).flex_none().mx(6).mt(6).px(8).gap(6).items_center().rounded(7)
       .border_1().border_color(this.searching ? t.accent : t.border)
       .on_click(() => this.input.focus())
       .on_key_down((e, cx) => {
         if (e.key === "escape") { if (!this.query) return; this.input.set_value(""); this.setQuery("", cx); }
-        else if (e.key === "down" && this.hits.length) this.at = (this.at + 1) % this.hits.length;
-        else if (e.key === "up" && this.hits.length) this.at = (this.at + this.hits.length - 1) % this.hits.length;
+        else if (e.key === "down" && count) this.at = (this.at + 1) % count;
+        else if (e.key === "up" && count) this.at = (this.at + count - 1) % count;
         else return;
-        if (this.hits.length) this.hitScroll.scroll_to_item(this.at);
+        if (count) this.hitScroll.scroll_to_item(this.at);
         cx.stop_propagation(); cx.notify();
       })
       .child(svg("mods/sapphire-files/search.svg").size(14).flex_none().text_color(t.dim))
@@ -544,7 +605,19 @@ export default class Files extends View {
         .child(h_flex().flex_none().children(marked(name, base, found.marks, t.foreground, t.accent)))
         .child(h_flex().flex_1().min_w(0).overflow_hidden().text_size(11.5).children(marked(folder, 0, found.marks, t.dim, t.accent)));
     };
-    const hits = () => this.hits.length
+    // `/text`: one row per matching line, the file dim and the line's text after it.
+    const contentHit = (found, i) => h_flex().h(28).mx(6).px(8).gap(7).items_center().rounded(7).cursor_pointer().overflow_hidden().whitespace_nowrap().text_size(11.5)
+      .when(i === this.at, el => el.bg(t.selected)).hover(s => s.bg(t.hover))
+      .child(div().flex_none().max_w(180).truncate().text_color(t.dim).child(`${found.path.split("/").pop()}:${found.line}`))
+      .child(div().flex_1().min_w(0).truncate().font_family(settings().font_family ?? "JetBrains Mono").text_color(t.foreground).child(found.text));
+    const contentHits = () => this.contentHits.length
+      ? div().flex_1().min_h(0).relative().pt(6)
+        .child(v_virtual_list("files-content-hits", this.contentHits.length, 28, i => `${this.contentHits[i]?.path}:${this.contentHits[i]?.line}`,
+          range => this.contentHits.slice(range.start, range.end).map((found, k) => contentHit(found, range.start + k))).track_scroll(this.hitScroll).size_full()
+          .on_item_click((key, cx) => { const i = this.contentHits.findIndex(h => `${h.path}:${h.line}` === key); if (i >= 0) { this.at = i; this.open(this.contentHits[i].path, cx, this.contentHits[i].line); } }))
+        .child(Scrollbar.vertical("files-content-hits").viewport_from_layout().absolute().inset_0())
+      : div().flex_1().min_h(0).p(14).text_size(12).text_color(t.dim).child(this.contentError || (this.contentBusy ? "Searching…" : this.content.length < 2 ? "Type at least 2 characters" : "No lines match"));
+    const hits = () => this.content !== null ? contentHits() : this.hits.length
       ? div().flex_1().min_h(0).relative().pt(6)
         .child(v_virtual_list("files-hits", this.hits.length, 28, i => this.hits[i]?.file.path ?? String(i),
           range => this.hits.slice(range.start, range.end).map((found, k) => hit(found, range.start + k))).track_scroll(this.hitScroll).size_full()

@@ -11,7 +11,8 @@ export const SKIP = new Set("this super self new return await yield typeof insta
 // Before `name(`, these make it a call, not a definition.
 const CALL_PREFIX = new Set("return await new yield throw if while for switch else case typeof delete void in of and or not".split(" "));
 const EXCLUDE = ["node_modules", "dist", "build", "out", "target", "vendor", ".next", "coverage"];
-const EXCLUDE_FILES = ["*.min.js", "*.map", "*.lock", "*.svg", "*.json", "*.md"];
+const EXCLUDE_FILES = ["*.min.js", "*.map", "*.lock", "*.svg", "*.json", "*.md"]; // for a name's definitions and uses
+const EXCLUDE_GENERATED = ["*.min.js", "*.map", "*.lock"]; // for a text search: docs and data count
 const MAX_LINES = 20000; // lines with the word looked at, for a very common name
 export const LIMIT = 12;
 
@@ -50,15 +51,29 @@ function rank(text, js, path) {
   return null;
 }
 
-// Lines with the word, as [path, line, text]. git first (fast, honors .gitignore).
-async function lines(name, root, on) {
-  const git = await exec("git", ["--no-optional-locks", "-c", "core.fsmonitor=false", "grep", "-n", "-z", "-I", "-w", "-F", "--untracked", "-e", name, "--", ".",
-    ...EXCLUDE.map(d => `:(exclude)${d}`), ...EXCLUDE_FILES.map(f => `:(exclude)${f}`)], { cwd: root, on }).catch(() => null);
-  if (git && (git.code === 0 || git.code === 1)) return git.stdout.split("\n", MAX_LINES).filter(Boolean).map(row => row.split("\0"));
+// Lines with the text, as [path, line, text]: a whole word (`word`), any case
+// (`ignoreCase`). git first (fast, honors .gitignore), plain grep outside a repo.
+async function lines(text, root, on, { word = true, ignoreCase = false, max = MAX_LINES, all = false } = {}) {
+  const flags = (word ? "w" : "") + (ignoreCase ? "i" : ""), files = all ? EXCLUDE_GENERATED : EXCLUDE_FILES;
+  const git = await exec("git", ["--no-optional-locks", "-c", "core.fsmonitor=false", "grep", "-n", "-z", "-I", "-F", ...(flags ? [`-${flags}`] : []), "--untracked", "-e", text, "--", ".",
+    ...EXCLUDE.map(d => `:(exclude)${d}`), ...files.map(f => `:(exclude)${f}`)], { cwd: root, on }).catch(() => null);
+  if (git && (git.code === 0 || git.code === 1)) return git.stdout.split("\n", max).filter(Boolean).map(row => row.split("\0"));
   // -s -D skip: sockets and unreadable files are skipped quietly; code 2 with output is fine.
-  const grep = await exec("grep", ["-rnIwFs", "-D", "skip", ...EXCLUDE.map(d => `--exclude-dir=${d}`), "--exclude-dir=.git", ...EXCLUDE_FILES.map(f => `--exclude=${f}`), "-e", name, "."], { cwd: root, on });
+  const grep = await exec("grep", [`-rnIFs${flags}`, "-D", "skip", ...EXCLUDE.map(d => `--exclude-dir=${d}`), "--exclude-dir=.git", ...files.map(f => `--exclude=${f}`), "-e", text, "."], { cwd: root, on });
   if (grep.code > 1 && !grep.stdout) throw new Error(grep.stderr || "grep failed");
-  return grep.stdout.split("\n", MAX_LINES).filter(Boolean).map(row => { const m = /^\.\/(.*?):(\d+):(.*)$/.exec(row); return m ? [m[1], m[2], m[3]] : null; }).filter(Boolean);
+  return grep.stdout.split("\n", max).filter(Boolean).map(row => { const m = /^\.\/(.*?):(\d+):(.*)$/.exec(row); return m ? [m[1], m[2], m[3]] : null; }).filter(Boolean);
+}
+
+// Every line with `text`: { path, line, text }[] in file order, minified lines left out.
+// A whole word for a name's uses (⌥-click); any text, docs and data included, for the
+// search box's `/text`.
+export async function occurrences(text, { root, on, word = true, ignoreCase = false, max = 2000 }) {
+  const out = [];
+  for (const [path, line, t] of await lines(text, root, on, { word, ignoreCase, max, all: !word })) {
+    if (!path || !line || t === undefined || t.length > 2000) continue;
+    out.push({ path, line: Number(line), text: t.trim().slice(0, 200) });
+  }
+  return out;
 }
 
 // { path, line, text, rank }[], best first, at most LIMIT, never the place clicked from.
