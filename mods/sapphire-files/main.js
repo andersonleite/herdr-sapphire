@@ -8,6 +8,7 @@ import { v_flex, h_flex, Editor, EditorState, Input, InputState, Scrollbar, Text
 import { spaces, panes, focused, exec, readTextFile, watchFolder, theme, settings, window } from "herdr";
 import { tokenizer } from "./shiki.js";
 import { index, search } from "./fuzzy.js";
+import { definitions, SKIP } from "./definitions.js";
 
 function location() {
   const space = spaces().find(s => s.active), f = focused();
@@ -56,6 +57,11 @@ const JSON_SYNTAX = {
 const jsonColors = () => JSON_SYNTAX[isDark() ? "dark" : "light"];
 const JSON_TOKEN = /("(?:[^"\\]|\\.)*"?)(?=(\s*:)?)|(\/\/.*|\/\*.*?(?:\*\/|$))|(-?\d[\w.+-]*|\b(?:true|false|null)\b)|(\s+)|([^\s"]+?)/g;
 const ROW = 19, CHAR = 7.2; // px: a code line's height and a character's width at text size 12
+// Go to definition (Shiki-drawn files only): with ⌘ held, each identifier is its own element,
+// underlined under the pointer; ⌘-click looks its definition up (./definitions.js) and opens
+// it, or lists the candidates. Words colored as keywords, strings or comments stay plain.
+const WORD = /[A-Za-z_$][\w$]*|[^A-Za-z_$]+/g;
+const MARK_MS = 1800; // how long the line jumped to stays lit
 
 // One line as runs of one color; neighbours of a color (and the spaces after them) are one run.
 function jsonRuns(line) {
@@ -142,6 +148,9 @@ export default class Files extends View {
     this.input.on("focus", (_e, cx) => { this.searching = true; cx.notify(); });
     this.input.on("blur", (_e, cx) => { this.searching = false; cx.notify(); });
     this.treeWidth = Number(localStorage.getItem("treeWidth")) || null; this.dragging = false;
+    // Go to definition: ⌘ seen on the last pointer move; where ⌘-clicks came from, to go
+    // back; the line to light; the candidates listed; a short notice in the header.
+    this.codeScroll = VirtualListScrollHandle.new(); this.cmd = false; this.history = []; this.mark = null; this.picks = null; this.notice = null;
     this.entries = new Map(); this.folders = new Set(); this.pending = new Set(); this.marks = {};
     this.refresh(cx);
     cx.timer.every(10000, cx => this.refresh(cx));
@@ -239,14 +248,90 @@ export default class Files extends View {
   }
 
   // Opens a search hit, its folders unfolded so the tree shows where it is.
-  open(path, cx) {
+  open(path, cx, line) {
     const parts = path.split("/");
     for (let i = 1; i < parts.length; i++) {
       const folder = parts.slice(0, i).join("/");
       if (!this.folders.has(folder)) this.toggle(folder, cx);
     }
-    this.show(path, cx);
+    this.show(path, cx, line);
     cx.notify();
+  }
+
+  // ⌘-click on `name` at line `line` of the open file.
+  goto(name, line, cx) {
+    if (this.looking || !this.root) return;
+    const context = this.context, from = { path: this.file, line };
+    this.looking = name; this.picks = null;
+    cx.notify();
+    cx.spawn(async cx => {
+      try {
+        const hits = await definitions(name, { root: context.cwd, on: context.on, from });
+        if (!this.current(context) || this.file !== from.path) return;
+        if (hits.length === 0) this.say(`No definition of ${name} found`, cx);
+        else if (hits.length === 1) this.jump(hits[0].path, hits[0].line, from, cx);
+        else this.picks = { name, from, hits, at: 0 };
+      } catch (e) { if (this.current(context)) this.say(`Lookup failed: ${String(e).slice(0, 80)}`, cx); }
+      finally { this.looking = null; cx.notify(); }
+    });
+  }
+
+  // ⌘-click on a quoted path (`"./lib.js"`, `"../x"`, `"src/y"`): the file it names, with
+  // the usual extensions and index files tried, relative to the open file or to the folder.
+  openPath(spec, line, cx) {
+    if (this.looking || !this.root || !spec.trim()) return;
+    const from = { path: this.file, line };
+    if (spec.startsWith("/")) { this.say("That path is outside this folder", cx); return; }
+    if (!/^\.\.?\//.test(spec) && !spec.includes("/") && !/\.\w+$/.test(spec)) { this.say(`${spec} is a package, not a file here`, cx); return; }
+    const base = /^\.\.?\//.test(spec) && this.file.includes("/") ? this.file.slice(0, this.file.lastIndexOf("/")).split("/") : [];
+    const parts = [...base];
+    for (const p of spec.split("/")) {
+      if (p === "." || p === "") continue;
+      if (p === "..") { if (!parts.length) { this.say("That path is outside this folder", cx); return; } parts.pop(); }
+      else parts.push(p);
+    }
+    const target = parts.join("/");
+    if (!target) return;
+    const tries = [target, ...["ts", "tsx", "js", "jsx", "mjs", "d.ts"].map(e => `${target}.${e}`),
+      ...(/\.jsx?$/.test(target) ? [target.replace(/\.jsx?$/, ".ts"), target.replace(/\.jsx?$/, ".tsx")] : []),
+      ...["ts", "tsx", "js"].map(e => `${target}/index.${e}`)];
+    const context = this.context;
+    this.looking = spec; cx.notify();
+    cx.spawn(async cx => {
+      try {
+        const r = await exec("sh", ["-c", 'for f in "$@"; do [ -f "$f" ] && { printf "%s" "$f"; exit 0; }; done; exit 1', "files", ...tries], { cwd: context.cwd, on: context.on });
+        if (!this.current(context) || this.file !== from.path) return;
+        if (r.code === 0 && r.stdout) this.jump(r.stdout, undefined, from, cx);
+        else this.say(`No file ${spec} here`, cx);
+      } catch (e) { if (this.current(context)) this.say(`Lookup failed: ${String(e).slice(0, 80)}`, cx); }
+      finally { this.looking = null; cx.notify(); }
+    });
+  }
+
+  // Opens `path` at `line`, remembering where we came from (the ↩ button in the header).
+  jump(path, line, from, cx) {
+    if (from?.path) { this.history.push(from); if (this.history.length > 50) this.history.shift(); }
+    this.picks = null;
+    this.open(path, cx, line);
+  }
+
+  back(cx) {
+    const to = this.history.pop();
+    if (to) this.open(to.path, cx, to.line);
+  }
+
+  say(text, cx) {
+    this.notice = text;
+    cx.timer.after(2500, cx => { if (this.notice === text) { this.notice = null; cx.notify(); } });
+    cx.notify();
+  }
+
+  // Scrolls the drawn file to a line and lights it for a moment.
+  reveal(line, cx) {
+    const index = Math.max(0, Math.min(line - 1, (this.view?.count ?? 1) - 1));
+    this.codeScroll.scroll_to_item(index, "center");
+    this.mark = index;
+    cx.timer.after(MARK_MS, cx => { if (this.mark === index) { this.mark = null; cx.notify(); } });
   }
 
   toggle(path, cx) {
@@ -270,9 +355,11 @@ export default class Files extends View {
     cx.notify();
   }
 
-  show(path, cx) {
+  show(path, cx, line) {
     this.code?.release(); this.code = null; this.view = null; this.markdown = null; this.file = path; this.fileError = null;
     this.shownDark = isDark(); // the appearance the preview was colored for (see render)
+    this.mark = null; this.picks = null; this.cmd = false;
+    if (!path) this.history = [];
     if (!path || !cx) return;
     const context = this.context, root = this.root, on = this.on;
     cx.spawn(async cx => {
@@ -286,13 +373,14 @@ export default class Files extends View {
         if (ext === "json" || ext === "jsonc" || (SHIKI[ext] && text.length <= SHIKI_MAX)) {
           const body = (text.length > 400000 ? text.slice(0, 400000) + "\n… (file truncated)" : text).replace(/\r\n?/g, "\n").replace(/\t/g, "  ").replace(/\n$/, "");
           const lines = body.split("\n"), longest = lines.reduce((n, line) => Math.max(n, line.length), 0), width = Math.ceil(Math.min(longest, 4020) * CHAR);
-          if (!SHIKI[ext]) { this.view = { count: lines.length, width, runs: i => jsonRuns(lines[i].length > 4000 ? lines[i].slice(0, 4000) + "… (line truncated)" : lines[i]) }; return; }
+          if (!SHIKI[ext]) { this.view = { count: lines.length, width, runs: i => jsonRuns(lines[i].length > 4000 ? lines[i].slice(0, 4000) + "… (line truncated)" : lines[i]) }; if (line) this.reveal(line, cx); return; }
           if (longest <= SHIKI_LINE_MAX) try {
             const next = tokenizer(SHIKI[ext], SHIKI_THEME()), rows = new Array(lines.length);
-            const view = { count: lines.length, width, runs: i => rows[i] ?? [{ text: lines[i], color: jsonColors().text }] };
+            const view = { count: lines.length, width, code: true, runs: i => rows[i] ?? [{ text: lines[i], color: jsonColors().text }] };
             const color = from => next(lines.slice(from, from + SHIKI_PIECE).join("\n")).forEach((runs, k) => { rows[from + k] = runs; });
             color(0);
             this.view = view;
+            if (line) this.reveal(line, cx);
             // The rest in turns, letting the window draw in between; a file closed meanwhile stops them.
             const rest = (from, cx) => {
               if (from >= lines.length || this.view !== view) return;
@@ -339,14 +427,69 @@ export default class Files extends View {
   codeView(t) {
     const view = this.view, id = `files-code-${this.file}`;
     const numbers = Math.max(2, String(view.count).length) * CHAR + 6, gap = 21; // lines up with the editor's gutter
+    // With ⌘ held over a Shiki-drawn file, the row under the pointer lights and the cursor
+    // is a hand (styles only: a list row may carry no handlers, they throw there, and
+    // splitting a line into words would shift its glyphs). The click comes from the list
+    // (`on_item_click`: which row) and the word from where the pointer last was
+    // (`on_mouse_move` on the sheet behind the rows).
+    const s = syntax(), strings = new Set([s.string, s["string.escape"]].map(c => c.toLowerCase()));
+    const linked = Boolean(view.code) && this.cmd && !this.picks;
     const row = index => h_flex().h(ROW).flex_none().items_center().whitespace_nowrap()
+      .when(index === this.mark, el => el.bg(t.selected))
+      .when(linked, el => el.id(`files-row-${index}`).cursor_pointer().hover(el => el.bg(t.hover)))
       .child(div().w(numbers).mr(gap).flex_none().text_right().text_color(t.dim).child(String(index + 1)))
       .children(view.runs(index).map(run => div().flex_none().text_color(run.color).child(run.text)));
-    return div().flex_1().min_h(0).relative().font_family(settings().font_family ?? "JetBrains Mono").text_size(12)
+    // The column under the pointer: positions come in window pixels, widths before the zoom.
+    const column = x => Math.floor(x / (settings().zoom || 1) / CHAR - (numbers + gap) / CHAR);
+    const clicked = (key, cx) => {
+      if (!linked || this.pointerX === undefined) return;
+      const index = Number(key), col = column(this.pointerX), runs = view.runs(index), text = runs.map(r => r.text).join("");
+      if (col < 0 || col >= text.length) return;
+      // Inside a string: a quoted path opens that file.
+      let at = 0, run = null;
+      for (const r of runs) { if (col < at + r.text.length) { run = r; break; } at += r.text.length; }
+      if (run && strings.has(String(run.color).toLowerCase())) {
+        for (const m of text.matchAll(/(["'`])([^"'`]*)\1/g)) if (m.index < col && col < m.index + m[0].length) { this.openPath(m[2], index + 1, cx); return; }
+        return;
+      }
+      for (const m of text.matchAll(WORD)) if (m.index <= col && col < m.index + m[0].length) {
+        if (/^[A-Za-z_$]/.test(m[0]) && !SKIP.has(m[0])) this.goto(m[0], index + 1, cx);
+        return;
+      }
+    };
+    return div().id("files-code").flex_1().min_h(0).relative().font_family(settings().font_family ?? "JetBrains Mono").text_size(12)
+      .when(Boolean(view.code), el => el.on_hover((hovered, cx) => { if (!hovered && this.cmd) { this.cmd = false; cx.notify(); } }))
       .child(div().id("files-code-x").size_full().overflow_x_scrollbar()
-        .child(div().w_full().min_w(numbers + gap + view.width + 24).h_full().child(v_virtual_list(id, view.count, ROW, i => String(i),
-          range => Array.from({ length: range.end - range.start }, (_, k) => row(range.start + k))).size_full())))
-      .child(Scrollbar.vertical(id).viewport_from_layout().absolute().inset_0());
+        .child(div().id("files-code-sheet").w_full().min_w(numbers + gap + view.width + 24).h_full()
+          // ⌘ is read off pointer moves: the panel has no keyboard focus to see the key itself.
+          .when(Boolean(view.code), el => el.on_mouse_move((e, cx) => {
+            this.pointerX = e.local_position.x;
+            this.cmd = Boolean(e.modifiers.platform);
+            // While ⌘ is held, every move redraws so the lit row follows the pointer (the
+            // hover style is only re-read when the list paints).
+            if (this.cmd || this.litRows) { this.litRows = this.cmd; cx.notify(); }
+          }))
+          .child(v_virtual_list(id, view.count, ROW, i => String(i),
+            range => Array.from({ length: range.end - range.start }, (_, k) => row(range.start + k))).track_scroll(this.codeScroll).size_full()
+            .when(Boolean(view.code), el => el.on_item_click(clicked)))))
+      .child(Scrollbar.vertical(id).viewport_from_layout().absolute().inset_0())
+      .when(Boolean(this.picks), el => el.child(this.picksView(t)));
+  }
+
+  // Several places define the ⌘-clicked name: a list over the code to choose from.
+  picksView(t) {
+    const { name, from, hits } = this.picks;
+    return div().id("files-picks-sheet").absolute().inset_0().on_click((_e, cx) => { this.picks = null; cx.notify(); })
+      .child(v_flex().id("files-picks").absolute().top(8).left(12).right(12).max_w(560).max_h(ROW * 14 + 40).rounded(8).overflow_hidden()
+        .bg(t.popover).border_1().border_color(t.border).shadow_lg().text_size(12)
+        .on_click((_e, cx) => cx.stop_propagation())
+        .child(h_flex().h(28).px(10).flex_none().items_center().gap(6).border_b(1).border_color(t.border).text_color(t.dim).text_size(11.5)
+          .child(div().font_semibold().text_color(t.foreground).child(name)).child(div().child(`· ${hits.length} definitions`)))
+        .child(v_flex().flex_1().min_h(0).overflow_y_scrollbar().py(4).children(hits.map((hit, i) =>
+          h_flex().id(`files-pick-${i}`).h(ROW + 7).flex_none().items_center().gap(8).px(10).cursor_pointer().whitespace_nowrap().hover(el => el.bg(t.hover))
+            .on_click((_e, cx) => this.jump(hit.path, hit.line, from, cx))
+            .child(div().flex_none().text_color(t.accent).child(`${hit.path}:${hit.line}`))
+            .child(div().flex_1().min_w(0).truncate().text_color(t.muted).child(hit.text))))));
   }
 
   rows(prefix, depth, out, t) {
@@ -416,7 +559,13 @@ export default class Files extends View {
       .child(h_flex().h(42).flex_none().px(14).gap(8).items_center().border_b(1).border_color(t.border)
         .when(open, el => el.child(div().id("files-back").w(20).cursor_pointer().text_color(t.muted).on_click((_e, cx) => { this.show(null); cx.notify(); }).child("←")))
         .child(div().font_semibold().child("Files"))
-        .child(div().flex_1().min_w(0).truncate().text_right().text_size(12).text_color(t.dim).child(this.file ?? this.root?.split(/[\\/]/).pop() ?? ""))
+        // After a ⌘-click jump: back to where it came from.
+        .when(open && this.history.length > 0, el => el.child(h_flex().id("files-history-back").h(22).px(6).flex_none().items_center().gap(4).rounded(6).cursor_pointer()
+          .text_size(11.5).text_color(t.muted).hover(s => s.bg(t.hover).text_color(t.foreground))
+          .on_click((_e, cx) => this.back(cx))
+          .child("↩").child(div().max_w(160).truncate().child(`${this.history[this.history.length - 1].path.split("/").pop()}:${this.history[this.history.length - 1].line}`))))
+        .child(div().flex_1().min_w(0).truncate().text_right().text_size(12).text_color(this.notice ? t.blocked : t.dim)
+          .child(this.notice ?? (this.looking ? `Looking for ${this.looking}…` : this.file ?? this.root?.split(/[\\/]/).pop() ?? "")))
         // Markdown only: its source, or how it reads.
         .when(open && this.markdown !== null, el => el.child(h_flex().flex_none().gap(2).children([["source", "code", false], ["rendered", "eye", true]].map(([name, icon, rendered]) =>
           h_flex().id(`files-md-${name}`).size(24).flex_none().items_center().justify_center().rounded(6).cursor_pointer()

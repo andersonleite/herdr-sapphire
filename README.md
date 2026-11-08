@@ -44,6 +44,11 @@ worktrees) in the spaces' repos, `sh -c` for a few git pipelines, and `node` on
   their duration on the right; `user@host` only over SSH.
 - Spaces named `[x] …`, `[xy] …` or `[xyz] …` form a group: same avatar color, tag shown on the
   avatar, tag hidden from the name.
+- Go to definition (Files panel, js/ts/jsx/tsx files): hold ⌘, the row under the pointer lights;
+  ⌘-click a name opens where it is defined (one hit: straight there, the line lit for a moment;
+  several: a list to pick from), ⌘-click a quoted path (`"./lib.js"`) opens that file. ↩ in
+  the header goes back. Found by text (`git grep` + the shapes of a definition), not by a
+  parser, so same-named things in other scopes show up too.
 
 ## Layout of this repo
 
